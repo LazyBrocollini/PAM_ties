@@ -3,806 +3,651 @@ from __future__ import annotations
 # Generated single-file deployment; rebuild with scripts/build_standalone.py
 
 
-# --- src/sequence_utils.py ---
-
+# --- src/data_utils.py ---
+"""Spreadsheet normalization only; no reference sequence mapping."""
+import math
 import re
-from typing import Iterable
-
-DNA_BASES = set("ACGTN")
-_IUPAC = {
-    "A": set("A"), "C": set("C"), "G": set("G"), "T": set("T"),
-    "N": set("ACGTN"), "V": set("ACG"), "B": set("CGT"), "D": set("AGT"),
-    "H": set("ACT"), "K": set("GT"), "M": set("AC"), "R": set("AG"),
-    "S": set("CG"), "W": set("AT"), "Y": set("CT"),
-}
-
-
-def normalize_sequence(value: object) -> str:
-    """Normalize a DNA-like sequence, removing FASTA decoration and whitespace."""
-    if value is None:
-        return ""
-    text = str(value).replace("\ufeff", "").strip()
-    if not text:
-        return ""
-    lines = text.splitlines()
-    if any(line.lstrip().startswith(">") for line in lines):
-        lines = [line for line in lines if not line.lstrip().startswith(">")]
-    text = "".join(lines)
-    text = re.sub(r"\s+", "", text).upper()
-    # Common formatting/gap characters are not sequence content.
-    return text.replace("-", "").replace(".", "").replace("|", "")
-
-
-def normalize_reference(value: object) -> tuple[str, str | None]:
-    sequence = normalize_sequence(value)
-    if not sequence:
-        return "", "Reference sequence is empty after normalization."
-    invalid = sorted(set(sequence) - DNA_BASES)
-    if invalid:
-        return "", f"Reference sequence contains invalid base(s): {', '.join(invalid)}. Allowed: A, C, G, T, N."
-    return sequence, None
-
-
-def reverse_complement(sequence: str) -> str:
-    sequence = normalize_sequence(sequence)
-    complement = str.maketrans("ACGTN", "TGCAN")
-    return sequence.translate(complement)[::-1]
-
-
-def find_all_exact(sequence: str, pattern: str) -> list[int]:
-    """Return 0-based starts; N in either sequence acts as an ambiguity wildcard."""
-    sequence = normalize_sequence(sequence)
-    pattern = normalize_sequence(pattern)
-    if not pattern or len(pattern) > len(sequence):
-        return []
-    hits: list[int] = []
-    for start in range(len(sequence) - len(pattern) + 1):
-        window = sequence[start : start + len(pattern)]
-        if all(a == b or a == "N" or b == "N" for a, b in zip(window, pattern)):
-            hits.append(start)
-    return hits
-
-
-def iupac_matches(observed: str, pattern: str) -> bool:
-    observed = normalize_sequence(observed)
-    pattern = normalize_sequence(pattern)
-    if len(observed) != len(pattern) or not observed:
-        return False
-    return all(base in _IUPAC.get(code, {code}) for base, code in zip(observed, pattern))
-
-
-def clean_identifier(value: object) -> str:
-    """Normalize Excel IDs, including numeric cells rendered as ``2000471.0``."""
-    if value is None:
-        return ""
-    if isinstance(value, float) and value.is_integer():
-        return str(int(value))
-    text = str(value).strip()
-    if re.fullmatch(r"[+-]?\d+\.0+", text):
-        return text.split(".", 1)[0]
-    return text
-
-
-def display_values(values: Iterable[object]) -> str:
-    result: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        text = clean_identifier(value)
-        if text and text not in seen:
-            result.append(text)
-            seen.add(text)
-    return "; ".join(result)
-
-# --- src/io_utils.py ---
-
-from collections import defaultdict
-from io import BytesIO
-from pathlib import Path
-from typing import Any
-
+from decimal import Decimal, InvalidOperation
 import pandas as pd
 
+METRICS = ('135 Indel%', '45 Indel%', '11 Indel%', '0 Indel%')
 
-ALL_GUIDES_SHEET = "All Guides"
-SPACER_SHEETS = ("all_spacer_data.registered_JAG1", "all_spacer_data.registered_hJAG")
-INDel_FIELDS = ("135 Indel%", "45 Indel%", "11 Indel%", "0 Indel%")
+def text(value):
+    if value is None:
+        return ''
+    try:
+        if pd.isna(value):
+            return ''
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
 
 
-def _norm_col(value: object) -> str:
-    return "".join(ch.lower() for ch in str(value).strip() if ch.isalnum())
+def identifier(value):
+    value = text(value)
+    if re.fullmatch(r'[+-]?\d+\.0+', value):
+        return value.split('.')[0]
+    return value
 
 
-def _find_column(columns: list[object], candidates: list[str]) -> str | None:
-    lookup = {_norm_col(col): str(col) for col in columns}
-    for candidate in candidates:
-        if _norm_col(candidate) in lookup:
-            return lookup[_norm_col(candidate)]
+def spacer_text(value):
+    # Used only as a workbook-join fallback, never for genomic searching.
+    return re.sub(r'\s+', '', text(value)).upper()
+
+
+def distinct(values):
+    result = []
+    for value in values:
+        for token in text(value).split(';'):
+            token = token.strip()
+            if token and token not in result:
+                result.append(token)
+    return '; '.join(result)
+
+
+def numeric_values(value):
+    out = []
+    for token in text(value).split(';'):
+        try:
+            number = float(token.strip().removesuffix('%').strip())
+        except (ValueError, TypeError):
+            continue
+        if math.isfinite(number):
+            out.append(number)
+    return out
+
+
+def numeric_indel(value):
+    numbers = numeric_values(value)
+    return max(numbers) if numbers else None
+
+
+def integer_site(value):
+    try:
+        number = Decimal(text(value))
+        if number.is_finite() and number >= 0 and number == number.to_integral_value():
+            return int(number)
+    except InvalidOperation:
+        pass
     return None
 
 
-def _value(row: pd.Series, column: str | None) -> object:
-    return row[column] if column and column in row.index else ""
+def normalize_strand(value):
+    value = text(value).lower()
+    if value in ('+', '+1', '1', 'forward', 'plus', 'fwd'):
+        return '+'
+    if value in ('-', '-1', 'reverse', 'minus', 'rev'):
+        return '-'
+    return ''
 
-
-def _nonempty(values: list[object]) -> list[str]:
-    return [clean_identifier(v) for v in values if clean_identifier(v)]
-
-
-def _aggregate(rows: list[pd.Series], column: str | None, normalize_seq: bool = False) -> str:
-    vals = []
-    for row in rows:
-        raw = _value(row, column)
-        val = normalize_sequence(raw) if normalize_seq else clean_identifier(raw)
-        if val:
-            vals.append(val)
-    return display_values(vals)
-
-
-def _read_excel(source: bytes | str | Path) -> tuple[pd.ExcelFile, str]:
-    if isinstance(source, (str, Path)):
-        return pd.ExcelFile(source), Path(source).name
-    return pd.ExcelFile(BytesIO(source)), "uploaded_workbook.xlsx"
-
-
-def parse_workbook(source: bytes | str | Path) -> dict[str, Any]:
-    """Parse, normalize, and join workbook data while preserving provenance."""
-    xls, workbook_name = _read_excel(source)
-    sheet_names = list(xls.sheet_names)
-    warnings: list[str] = []
-    checks: list[dict[str, Any]] = []
-    if ALL_GUIDES_SHEET not in sheet_names:
-        warnings.append(f"Missing required sheet: {ALL_GUIDES_SHEET}")
-        return {"workbook_name": workbook_name, "sheet_names": sheet_names, "guides": pd.DataFrame(),
-                "warnings": warnings, "checks": checks, "unmatched_all_guides": pd.DataFrame(),
-                "missing_spacers": pd.DataFrame(), "duplicate_identifiers": pd.DataFrame(),
-                "available_nucleases": [], "available_strands": [], "available_sources": []}
-
-    all_df = pd.read_excel(xls, sheet_name=ALL_GUIDES_SHEET, dtype=object)
-    all_columns = list(all_df.columns)
-    ion_col = _find_column(all_columns, ["Ionis#", "Ion_ID", "Ion ID", "Ionis ID"])
-    spacer_col = _find_column(all_columns, ["Spacer Sequence", "spacer", "Spacer"])
-    if not ion_col and not spacer_col:
-        warnings.append("All Guides is missing both an Ionis#/Ion_ID column and a Spacer Sequence column.")
-        return {"workbook_name": workbook_name, "sheet_names": sheet_names, "guides": pd.DataFrame(),
-                "warnings": warnings, "checks": checks, "unmatched_all_guides": all_df,
-                "missing_spacers": pd.DataFrame(), "duplicate_identifiers": pd.DataFrame(),
-                "available_nucleases": [], "available_strands": [], "available_sources": []}
-
-    all_rows: list[dict[str, Any]] = []
-    for idx, row in all_df.iterrows():
-        record = {str(col): row[col] for col in all_columns}
-        record.update({
-            "_all_row": int(idx) + 2,
-            "_ion_key": clean_identifier(_value(row, ion_col)),
-            "_spacer_key": normalize_sequence(_value(row, spacer_col)),
-        })
-        all_rows.append(record)
-
-    spacer_frames: list[pd.DataFrame] = []
-    for sheet in SPACER_SHEETS:
-        if sheet not in sheet_names:
-            warnings.append(f"Optional spacer-data sheet not found: {sheet}")
-            continue
-        frame = pd.read_excel(xls, sheet_name=sheet, dtype=object)
-        frame["_source_sheet"] = sheet
-        frame["_spacer_source_row"] = frame.index + 2
-        spacer_frames.append(frame)
-    if not spacer_frames:
-        warnings.append("Neither expected spacer-data sheet was available; no joined guides can be analyzed.")
-        return {"workbook_name": workbook_name, "sheet_names": sheet_names, "guides": pd.DataFrame(),
-                "warnings": warnings, "checks": checks, "unmatched_all_guides": all_df,
-                "missing_spacers": pd.DataFrame(), "duplicate_identifiers": pd.DataFrame(),
-                "available_nucleases": [], "available_strands": [], "available_sources": []}
-
-    spacer_df = pd.concat(spacer_frames, ignore_index=True, sort=False)
-    sp_ion_col = _find_column(list(spacer_df.columns), ["Ion_ID", "Ionis#", "Ion ID", "Ionis ID"])
-    sp_seq_col = _find_column(list(spacer_df.columns), ["spacer", "Spacer Sequence", "Spacer"])
-    nuclease_col = _find_column(list(spacer_df.columns), ["nuclease", "enzyme", "Nuclease/Enzyme", "Nuclease"])
-    strand_col = _find_column(list(spacer_df.columns), ["strand", "guide strand", "orientation"])
-    pam_col = _find_column(list(spacer_df.columns), ["PAM", "pam"])
-    pam_site_col = _find_column(list(spacer_df.columns), ["pam_site", "PAM site", "pam site"])
-    cut_site_col = _find_column(list(spacer_df.columns), ["cut_site", "cut site"])
-    if not sp_seq_col:
-        warnings.append("Spacer-data sheets are missing a spacer column.")
-
-    # Deduplicate spacer rows by the requested normalized tuple, preserving row provenance.
-    dedup: dict[tuple[str, str, str, str, str], list[pd.Series]] = defaultdict(list)
-    for _, row in spacer_df.iterrows():
-        key = (
-            normalize_sequence(_value(row, sp_seq_col)),
-            clean_identifier(_value(row, nuclease_col)),
-            clean_identifier(_value(row, strand_col)),
-            clean_identifier(_value(row, pam_site_col)),
-            clean_identifier(_value(row, cut_site_col)),
-        )
-        dedup[key].append(row)
-
-    joined: list[dict[str, Any]] = []
-    matched_all_rows: set[int] = set()
-    missing_spacers: list[dict[str, Any]] = []
-    duplicate_identifier_rows: list[dict[str, Any]] = []
-    all_lookup_ion: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    all_lookup_spacer: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for rec in all_rows:
-        if rec["_ion_key"]:
-            all_lookup_ion[rec["_ion_key"]].append(rec)
-        if rec["_spacer_key"]:
-            all_lookup_spacer[rec["_spacer_key"]].append(rec)
-
-    for key, rows in dedup.items():
-        row = rows[0]
-        spacer = key[0]
-        if not spacer:
-            missing_spacers.append({"source_sheet": row["_source_sheet"], "source_row": int(row["_spacer_source_row"]), "reason": "Missing spacer sequence"})
-            continue
-        ion_key = clean_identifier(_value(row, sp_ion_col))
-        candidates = all_lookup_ion.get(ion_key, []) if ion_key else []
-        join_method = "Ionis#"
-        if not candidates:
-            candidates = all_lookup_spacer.get(spacer, [])
-            join_method = "Spacer Sequence fallback"
-        if not candidates:
-            continue
-        for candidate in candidates:
-            matched_all_rows.add(candidate["_all_row"])
-        all_source_rows = sorted({c["_all_row"] for c in candidates})
-        all_ionis = _aggregate([pd.Series(c) for c in candidates], ion_col)
-        all_spacers = _aggregate([pd.Series(c) for c in candidates], spacer_col, normalize_seq=True)
-        source_fields = {
-            "Source Sheet": _aggregate([pd.Series(c) for c in candidates], _find_column(all_columns, ["Source Sheet", "source sheet"])),
-            "Source Row": "; ".join(str(x) for x in all_source_rows),
-            "source_row": "; ".join(str(x) for x in all_source_rows),
-            "gRNA Name": _aggregate([pd.Series(c) for c in candidates], _find_column(all_columns, ["gRNA Name", "gRNA_Name", "guide name"])),
-            "Ionis#": all_ionis or ion_key,
-            "Description": _aggregate([pd.Series(c) for c in candidates], _find_column(all_columns, ["Description"])),
-            "135 Indel%": _aggregate([pd.Series(c) for c in candidates], _find_column(all_columns, ["135 Indel%", "135 Indel"])),
-            "45 Indel%": _aggregate([pd.Series(c) for c in candidates], _find_column(all_columns, ["45 Indel%", "45 Indel"])),
-            "11 Indel%": _aggregate([pd.Series(c) for c in candidates], _find_column(all_columns, ["11 Indel%", "11 Indel"])),
-            "0 Indel%": _aggregate([pd.Series(c) for c in candidates], _find_column(all_columns, ["0 Indel%", "0 Indel"])),
-            "Spacer Sequence": all_spacers or spacer,
-            "PAM": _aggregate([pd.Series(c) for c in candidates], _find_column(all_columns, ["PAM", "pam"])),
-            "Notes": _aggregate([pd.Series(c) for c in candidates], _find_column(all_columns, ["Notes", "Note"])),
-        }
-        base = {str(k): v for k, v in row.items() if not str(k).startswith("_")}
-        base.update({
-            "source_sheet": str(row["_source_sheet"]),
-            "spacer_source_rows": "; ".join(str(int(r["_spacer_source_row"])) for r in rows),
-            "spacer": spacer,
-            "source_ion_id": ion_key,
-            "source_spacer": spacer,
-            "source_nuclease": clean_identifier(_value(row, nuclease_col)),
-            "nuclease": clean_identifier(_value(row, nuclease_col)),
-            "source_strand": clean_identifier(_value(row, strand_col)),
-            "source_pam": clean_identifier(_value(row, pam_col)),
-            "source_pam_site": clean_identifier(_value(row, pam_site_col)),
-            "source_cut_site": clean_identifier(_value(row, cut_site_col)),
-            "join_method": join_method,
-        })
-        # Keep all spacer-data values available without collisions with the normalized result fields.
-        for col in spacer_df.columns:
-            if col not in base and not str(col).startswith("_"):
-                base[f"spacer_data__{col}"] = display_values([r[col] for r in rows])
-        base.update(source_fields)
-        joined.append(base)
-
-    unmatched = all_df.iloc[[i - 2 for i in range(2, len(all_df) + 2) if i not in matched_all_rows]].copy()
-    if not unmatched.empty:
-        warnings.append(f"{len(unmatched)} All Guides row(s) did not join to spacer data.")
-    for column, label in ((nuclease_col, "nuclease/enzyme"), (strand_col, "strand"), (pam_col, "PAM")):
-        if not column:
-            warnings.append(f"Spacer-data sheets are missing an optional annotation column: {label}.")
-    duplicate_ids = all_df[all_df.apply(lambda r: clean_identifier(_value(r, ion_col)), axis=1).duplicated(keep=False)] if ion_col else pd.DataFrame()
-    if not duplicate_ids.empty:
-        duplicate_identifier_rows = duplicate_ids.to_dict("records")
-        warnings.append(f"{len(duplicate_ids)} All Guides row(s) share duplicate Ionis# identifiers; values were aggregated.")
-
-    guides = pd.DataFrame(joined)
-    if guides.empty:
-        warnings.append("No whitelisted guides could be joined from All Guides to the spacer-data sheets.")
-    for field in INDel_FIELDS:
-        if field not in guides.columns:
-            guides[field] = ""
-        def _numeric_present(value: object) -> bool:
-            return any(token.strip().replace("%", "") for token in str(value or "").split(";") if token.strip().replace("%", "").strip()) and any(
-                _is_float(token.strip().replace("%", "")) for token in str(value or "").split(";")
-            )
-        def _is_float(token: str) -> bool:
-            try:
-                float(token)
-                return True
-            except (TypeError, ValueError):
-                return False
-        missing_count = int(sum(not _numeric_present(value) for value in guides[field])) if not guides.empty else 0
-        if missing_count:
-            warnings.append(f"{missing_count} joined guide row(s) have no numeric value for {field}.")
-    for col in ["source_nuclease", "source_strand", "source_pam"]:
-        if col not in guides.columns:
-            guides[col] = ""
-    checks.extend([
-        {"check": "Workbook sheets", "status": "warning" if warnings else "pass", "detail": "; ".join(warnings) if warnings else "Required and optional sheets loaded."},
-        {"check": "Missing spacer sequences", "status": "warning" if missing_spacers else "pass", "detail": f"{len(missing_spacers)} spacer-data row(s) missing a spacer."},
-        {"check": "Unmatched All Guides rows", "status": "warning" if not unmatched.empty else "pass", "detail": f"{len(unmatched)} row(s) did not join."},
-        {"check": "Duplicate identifiers", "status": "warning" if duplicate_identifier_rows else "pass", "detail": f"{len(duplicate_identifier_rows)} duplicate-ID row(s); distinct values preserved."},
-    ])
-    available = lambda col: sorted([x for x in guides.get(col, pd.Series(dtype=object)).dropna().astype(str).unique().tolist() if x and x != "nan"])
-    return {"workbook_name": workbook_name, "sheet_names": sheet_names, "guides": guides,
-            "warnings": warnings, "checks": checks, "unmatched_all_guides": unmatched,
-            "missing_spacers": pd.DataFrame(missing_spacers), "duplicate_identifiers": pd.DataFrame(duplicate_identifier_rows),
-            "available_nucleases": available("source_nuclease"), "available_strands": available("source_strand"),
-            "available_sources": sorted(guides.get("source_sheet", pd.Series(dtype=object)).dropna().astype(str).unique().tolist())}
-
-# --- src/guide_matching.py ---
-
-import re
-from typing import Any
-
-import pandas as pd
-
-
-_IUPAC_CODES = set("ACGTNRYSWKMBDHV")
-
-
-def _pattern_from_annotation(pam: object, nuclease: object) -> tuple[str, str]:
-    text = str(pam or "").strip().upper().replace("-", "")
-    candidate = "".join(ch for ch in text if ch in _IUPAC_CODES)
-    if candidate and len(candidate) >= 2:
-        return candidate, "workbook PAM"
-    nuc = str(nuclease or "").lower()
-    if any(term in nuc for term in ("cas12", "cpf1")):
-        return "TTTV", "inferred Cas12/CPF1 PAM"
-    if any(term in nuc for term in ("cas9", "spcas9", "s. pyogenes")):
-        return "NGG", "inferred Cas9 PAM"
-    return "", "PAM annotation unavailable"
-
-
-def _pam_side(pattern: str, nuclease: object) -> str:
-    nuc = str(nuclease or "").lower()
-    if any(term in nuc for term in ("cas12", "cpf1")) or pattern.startswith("TTT"):
-        return "5prime"
-    return "3prime"
-
-
-def _pam_for_hit(reference: str, spacer_start: int, spacer_end: int, orientation: str, pattern: str, nuclease: object) -> dict[str, Any]:
-    length = len(pattern)
-    side = _pam_side(pattern, nuclease)
-    # Coordinates below are 1-based inclusive. The anchor is the PAM base adjacent to the protospacer.
-    if side == "3prime":
-        if orientation == "+":
-            start, end = spacer_end + 1, spacer_end + length
-            anchor = start
-        else:
-            start, end = spacer_start - length, spacer_start - 1
-            anchor = end
-    else:  # 5' PAM relative to the guide orientation
-        if orientation == "+":
-            start, end = spacer_start - length, spacer_start - 1
-            anchor = end
-        else:
-            start, end = spacer_end + 1, spacer_end + length
-            anchor = start
-    if start < 1 or end > len(reference):
-        return {"pam_start": None, "pam_end": None, "pam_anchor": None, "pam_sequence": "",
-                "pam_valid": False, "pam_warning": f"PAM coordinates {start}-{end} fall outside the reference."}
-    observed_reference = reference[start - 1 : end]
-    observed = observed_reference if orientation == "+" else reverse_complement(observed_reference)
-    valid = iupac_matches(observed, pattern)
-    warning = None if valid else f"Observed PAM {observed} does not match {pattern} at {start}-{end}."
-    return {"pam_start": start, "pam_end": end, "pam_anchor": anchor, "pam_sequence": observed,
-            "pam_valid": valid, "pam_warning": warning}
-
-
-def match_guides(reference: str, guides: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
-    """Find every forward/reverse hit for each whitelisted, joined guide."""
-    hits: list[dict[str, Any]] = []
-    warnings: list[str] = []
-    if guides.empty:
-        return pd.DataFrame(), warnings
-    for guide_idx, guide in guides.iterrows():
-        spacer = str(guide.get("spacer", "") or "").upper()
-        if not spacer:
-            warnings.append(f"Missing spacer for source row(s) {guide.get('Source Row', guide_idx)}.")
-            continue
-        nuclease = str(guide.get("source_nuclease", "") or "")
-        pattern, pattern_source = _pattern_from_annotation(guide.get("source_pam") or guide.get("PAM", ""), nuclease)
-        forward_starts = find_all_exact(reference, spacer)
-        rc = reverse_complement(spacer)
-        reverse_starts = find_all_exact(reference, rc)
-        seen: set[tuple[int, str]] = set()
-        for orientation, starts in (("+", forward_starts), ("-", reverse_starts)):
-            for zero_start in starts:
-                if (zero_start, orientation) in seen:
-                    continue
-                seen.add((zero_start, orientation))
-                spacer_start = zero_start + 1
-                spacer_end = spacer_start + len(spacer) - 1
-                pam = _pam_for_hit(reference, spacer_start, spacer_end, orientation, pattern, nuclease) if pattern else {
-                    "pam_start": None, "pam_end": None, "pam_anchor": None, "pam_sequence": "", "pam_valid": False,
-                    "pam_warning": "No usable PAM pattern was available from the workbook or nuclease annotation."
-                }
-                if pam["pam_warning"]:
-                    warnings.append(f"{guide.get('source_sheet', '')} row {guide.get('spacer_source_rows', '')}: {pam['pam_warning']}")
-                hit = {k: v for k, v in guide.items()}
-                hit.update({
-                    "hit_index": len(hits), "strand": orientation, "spacer_start": spacer_start, "spacer_end": spacer_end,
-                    "pam_start": pam["pam_start"], "pam_end": pam["pam_end"], "pam_anchor": pam["pam_anchor"],
-                    "pam": pam["pam_sequence"] or guide.get("source_pam", guide.get("PAM", "")),
-                    "pam_pattern": pattern, "pam_pattern_source": pattern_source,
-                    "pam_valid": pam["pam_valid"], "pam_warning": pam["pam_warning"] or "",
-                })
-                source_sheet = str(hit.get("source_sheet", ""))
-                ion = str(hit.get("Ionis#", hit.get("source_ion_id", "")))
-                hit["hit_id"] = "|".join([source_sheet, ion, spacer, orientation, str(spacer_start), str(pam["pam_anchor"] or "NA")])
-                hits.append(hit)
-    result = pd.DataFrame(hits)
-    if len(hits) > len(guides):
-        warnings.append(f"Multiple reference hits were found for {len(hits) - len(guides)} additional guide occurrence(s); every exact hit is retained.")
-    if not result.empty:
-        result = result.drop_duplicates(subset=["hit_id"], keep="first").reset_index(drop=True)
-    return result, sorted(set(warnings))
-
-# --- src/nearby_pam.py ---
-
+# --- src/io_utils.py ---
 from collections import defaultdict
-from typing import Any
-
-import pandas as pd
-
-
-def _norm(value: object) -> str:
-    return str(value or "").strip().lower()
-
-
-def find_nearby(hits: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, list[str]]]:
-    """Return pair rows, connected-component group rows, and hit-to-entity maps."""
-    if hits.empty:
-        return pd.DataFrame(), pd.DataFrame(), {"hit_to_pairs": {}, "hit_to_groups": {}}
-    pairs: list[dict[str, Any]] = []
-    parent = {str(idx): str(idx) for idx in hits.index}
-
-    def find(x: str) -> str:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a: str, b: str) -> None:
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
-
-    for i in range(len(hits)):
-        a = hits.iloc[i]
-        for j in range(i + 1, len(hits)):
-            b = hits.iloc[j]
-            if a.get("pam_anchor") is None or b.get("pam_anchor") is None:
-                continue
-            if pd.isna(a.get("pam_anchor")) or pd.isna(b.get("pam_anchor")):
-                continue
-            if (_norm(a.get("source_sheet")) != _norm(b.get("source_sheet")) or
-                _norm(a.get("source_nuclease")) != _norm(b.get("source_nuclease")) or
-                _norm(a.get("strand")) != _norm(b.get("strand"))):
-                continue
-            distance = abs(int(a["pam_anchor"]) - int(b["pam_anchor"]))
-            if distance != 1:
-                continue
-            union(str(a.name), str(b.name))
-            pair_id = f"P{len(pairs) + 1:04d}"
-            pairs.append({
-                "pair_id": pair_id,
-                "hit_id_a": a["hit_id"], "hit_id_b": b["hit_id"],
-                "source_sheet": a.get("source_sheet", ""), "nuclease": a.get("source_nuclease", ""), "strand": a.get("strand", ""),
-                "pam_anchor_a": int(a["pam_anchor"]), "pam_anchor_b": int(b["pam_anchor"]),
-                "pam_distance_nt": distance,
-                "index_a": int(a.name), "index_b": int(b.name),
-            })
-
-    root_to_indices: dict[str, list[int]] = defaultdict(list)
-    for idx in hits.index:
-        root_to_indices[find(str(idx))].append(int(idx))
-    components = sorted(root_to_indices.values(), key=lambda x: min(x))
-    group_for_index: dict[int, str] = {}
-    groups: list[dict[str, Any]] = []
-    for n, indices in enumerate(components, 1):
-        if not any(any(p["index_a"] == idx or p["index_b"] == idx for p in pairs) for idx in indices):
-            continue
-        group_id = f"G{n:04d}"
-        for idx in indices:
-            group_for_index[idx] = group_id
-        group_hits = hits.loc[indices]
-        groups.append({
-            "group_id": group_id, "hit_indices": indices, "hit_ids": "; ".join(group_hits["hit_id"].astype(str)),
-            "source_sheet": group_hits.iloc[0].get("source_sheet", ""), "nuclease": group_hits.iloc[0].get("source_nuclease", ""),
-            "strand": group_hits.iloc[0].get("strand", ""), "pam_anchor_min": int(group_hits["pam_anchor"].min()),
-            "pam_anchor_max": int(group_hits["pam_anchor"].max()), "group_size": len(indices),
-        })
-    hit_to_pairs = defaultdict(list)
-    for p in pairs:
-        hit_to_pairs[p["hit_id_a"]].append(p["pair_id"])
-        hit_to_pairs[p["hit_id_b"]].append(p["pair_id"])
-    hit_to_groups = {hits.loc[idx, "hit_id"]: group_id for idx, group_id in group_for_index.items()}
-    pair_df = pd.DataFrame(pairs)
-    group_df = pd.DataFrame(groups)
-    return pair_df, group_df, {"hit_to_pairs": dict(hit_to_pairs), "hit_to_groups": hit_to_groups}
-
-# --- src/ranking.py ---
-
-from typing import Any
-
-import pandas as pd
-
-
-def numeric_indel(value: object) -> float | None:
-    """Return the highest numeric value in a preserved semicolon-delimited field."""
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return None
-    values: list[float] = []
-    for token in str(value).replace("%", "").split(";"):
-        token = token.strip()
-        if not token:
-            continue
-        try:
-            parsed = float(token)
-        except (TypeError, ValueError):
-            continue
-        if pd.notna(parsed):
-            values.append(parsed)
-    return max(values) if values else None
-
-
-def rank_hits(hits: pd.DataFrame, pairs: pd.DataFrame, groups: pd.DataFrame, links: dict[str, Any], metric: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if hits.empty:
-        return hits.copy(), pd.DataFrame()
-    out = hits.copy()
-    out["selected_indel_metric"] = metric
-    out["selected_indel_value"] = out.get(metric, pd.Series(index=out.index, dtype=object)).map(numeric_indel)
-    out["group_id"] = out["hit_id"].map(links.get("hit_to_groups", {})).fillna("")
-    pair_map = links.get("hit_to_pairs", {})
-    out["pair_id"] = out["hit_id"].map(lambda x: "; ".join(pair_map.get(x, [])))
-    out["pam_distance_nt"] = out["hit_id"].map(lambda x: 1 if pair_map.get(x, []) else "")
-    out["is_pair_or_group_winner"] = "No"
-    out["winner_reason"] = ""
-    best_rows: list[dict[str, Any]] = []
-
-    def choose(indices: list[int], entity_type: str, entity_id: str) -> None:
-        vals = [(idx, out.loc[idx, "selected_indel_value"]) for idx in indices]
-        numeric = [(idx, val) for idx, val in vals if val is not None]
-        if not numeric:
-            winner_indices: list[int] = []
-            reason = "No numeric Indel% available"
-            winner_text = "No numeric Indel% available"
-            value_text = ""
-        else:
-            max_value = max(val for _, val in numeric)
-            winner_indices = [idx for idx, val in numeric if val == max_value]
-            reason = "Tie for highest selected Indel%" if len(winner_indices) > 1 else "Highest selected Indel%"
-            winner_text = "; ".join(str(out.loc[idx, "hit_id"]) for idx in winner_indices)
-            value_text = max_value
-        for idx in winner_indices:
-            out.at[idx, "is_pair_or_group_winner"] = "Yes"
-            prior = out.at[idx, "winner_reason"]
-            out.at[idx, "winner_reason"] = "; ".join(x for x in [prior, f"{entity_type} winner" + (" (tie)" if len(winner_indices) > 1 else "")] if x)
-        for idx in winner_indices or [None]:
-            row = {"entity_type": entity_type, "entity_id": entity_id, "winner_hit_id": out.loc[idx, "hit_id"] if idx is not None else "",
-                   "winner_reason": reason, "selected_indel_metric": metric, "selected_indel_value": value_text}
-            if idx is not None:
-                for field in ("gRNA Name", "Ionis#", "source_nuclease", "strand", "spacer", "pam", "spacer_start", "spacer_end", "pam_start", "pam_end", "pam_anchor", "source_row", "Source Row"):
-                    if field in out.columns:
-                        row[field] = out.loc[idx, field]
-            best_rows.append(row)
-
-    for _, pair in pairs.iterrows():
-        choose([int(pair["index_a"]), int(pair["index_b"])], "pair", str(pair["pair_id"]))
-    for _, group in groups.iterrows():
-        choose([int(x) for x in group["hit_indices"]], "group", str(group["group_id"]))
-    return out, pd.DataFrame(best_rows)
-
-# --- src/visualization.py ---
-
-from html import escape
-from typing import Any
-
-import pandas as pd
-
-
-def sequence_html(reference: str, hits: pd.DataFrame, start: int = 1, end: int | None = None) -> str:
-    end = end or len(reference)
-    start = max(1, start)
-    end = min(len(reference), end)
-    colors = {"+": "#13795b", "-": "#7c3aed"}
-    spans: list[str] = []
-    for pos in range(start, end + 1):
-        base = escape(reference[pos - 1])
-        labels: list[str] = []
-        css = ""
-        if not hits.empty:
-            for _, hit in hits.iterrows():
-                in_spacer = hit.get("spacer_start") is not None and int(hit["spacer_start"]) <= pos <= int(hit["spacer_end"])
-                pam_start, pam_end = hit.get("pam_start"), hit.get("pam_end")
-                in_pam = pam_start is not None and pd.notna(pam_start) and pam_end is not None and pd.notna(pam_end) and int(pam_start) <= pos <= int(pam_end)
-                if in_spacer or in_pam:
-                    strand = str(hit.get("strand", "+"))
-                    css = f"background:{colors.get(strand, '#555')};color:white;"
-                    labels.append(f"{hit.get('gRNA Name', hit.get('Ionis#', 'guide'))} {strand} {'PAM' if in_pam else 'spacer'}")
-        title = escape(" | ".join(labels)) if labels else ""
-        spans.append(f'<span style="{css}" title="{title}">{base}</span>')
-    return '<div style="font-family:monospace;line-height:1.8;word-break:break-all;border:1px solid #d1d5db;padding:12px;border-radius:8px;">' + "".join(spans) + "</div>"
-
-
-def pair_table(hits: pd.DataFrame, pairs: pd.DataFrame, metric: str) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    for _, pair in pairs.iterrows():
-        a = hits.loc[int(pair["index_a"])]
-        b = hits.loc[int(pair["index_b"])]
-        av, bv = a.get("selected_indel_value"), b.get("selected_indel_value")
-        if av is None and bv is None:
-            winner = "No numeric Indel% available"
-        elif av is None:
-            winner = str(b.get("gRNA Name", b.get("Ionis#", b["hit_id"])))
-        elif bv is None or av > bv:
-            winner = str(a.get("gRNA Name", a.get("Ionis#", a["hit_id"])))
-        elif bv > av:
-            winner = str(b.get("gRNA Name", b.get("Ionis#", b["hit_id"])))
-        else:
-            winner = f"Tie: {a.get('gRNA Name', a['hit_id'])}; {b.get('gRNA Name', b['hit_id'])}"
-        rows.append({"pair_id": pair["pair_id"], "guide_a": a.get("gRNA Name", a.get("Ionis#", "")), "guide_b": b.get("gRNA Name", b.get("Ionis#", "")),
-                     "Ionis# A": a.get("Ionis#", ""), "Ionis# B": b.get("Ionis#", ""), "spacer A": a.get("spacer", ""), "spacer B": b.get("spacer", ""),
-                     "strand": pair.get("strand", ""), "nuclease": pair.get("nuclease", ""), "PAM anchor A": pair["pam_anchor_a"], "PAM anchor B": pair["pam_anchor_b"],
-                     "exact PAM distance (nt)": pair["pam_distance_nt"], f"{metric} A": av, f"{metric} B": bv, "Winner": winner})
-    return pd.DataFrame(rows)
-
-# --- Streamlit interface ---
-
+from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
-import sys
+from zipfile import BadZipFile
+import pandas as pd
 
+SPACER_SHEETS = ('all_spacer_data.registered_JAG1', 'all_spacer_data.registered_hJAG')
+ALIASES = {
+    'Ionis#': ('Ionis#', 'Ion_ID', 'Ion ID', 'guide_id'),
+    'gRNA Name': ('gRNA Name', 'guide_name'),
+    'spacer': ('spacer', 'Spacer Sequence'),
+    'pam_site': ('pam_site', 'PAM site'),
+    'nuclease': ('nuclease', 'enzyme', 'nuclease/enzyme'),
+    'strand': ('strand', 'orientation'),
+    'source_sheet': ('source_sheet', 'source dataset', 'dataset'),
+    'reference_id': ('reference_id', 'assembly', 'reference'),
+    'chromosome': ('chromosome', 'chrom', 'chr', 'contig'),
+    'pam': ('pam', 'PAM sequence'),
+    'cut_site': ('cut_site',),
+    'Description': ('Description',),
+    'Notes': ('Notes', 'Note'),
+    **{metric: (metric, metric.replace('%', '')) for metric in METRICS},
+}
+REQUIRED = ('Ionis#', 'pam_site', 'nuclease', 'strand', 'source_sheet')
+
+
+def _key(value):
+    return ''.join(ch.lower() for ch in str(value) if ch.isalnum())
+
+
+def _columns(frame):
+    lookup = {_key(col): col for col in frame.columns}
+    return {field: next((lookup[_key(alias)] for alias in aliases if _key(alias) in lookup), None)
+            for field, aliases in ALIASES.items()}
+
+
+def _get(row, columns, field):
+    col = columns.get(field)
+    return text(row.get(col, '')) if col is not None else ''
+
+
+def _check(checks, category, detail, source_sheet='', source_row='', severity='warning'):
+    checks.append(dict(category=category, severity=severity, source_sheet=source_sheet, source_row=source_row, detail=detail))
+
+
+def _raw_records(frame, sheet, checks, flat):
+    cols = _columns(frame)
+    required = REQUIRED if flat else ('pam_site', 'nuclease', 'strand')
+    missing = [field for field in required if cols.get(field) is None]
+    if not flat and cols['Ionis#'] is None and cols['spacer'] is None:
+        missing.append('Ionis# or spacer')
+    if flat and not any(cols[metric] is not None for metric in METRICS):
+        missing.append('at least one Indel% metric column')
+    if missing:
+        _check(checks, 'Missing columns', f'{sheet}: missing {", ".join(missing)}.', sheet, severity='error')
+        return []
+    records = []
+    for index, row in frame.iterrows():
+        if not any(text(v) for v in row):
+            continue
+        rec = {f'input__{col}': text(row[col]) for col in frame.columns}
+        rec.update({field: _get(row, cols, field) for field in ALIASES})
+        rec['source_sheet'] = rec['source_sheet'] or (sheet if not flat else '')
+        rec['input_sheet'] = sheet
+        rec['source_row'] = str(index + 2)
+        rec['Ionis#'] = identifier(rec['Ionis#'])
+        rec['spacer'] = spacer_text(rec['spacer'])
+        records.append(rec)
+    return records
+
+
+def _consolidated(frames, checks):
+    whitelist = frames['All Guides']
+    columns = _columns(whitelist)
+    if columns['Ionis#'] is None and columns['spacer'] is None:
+        _check(checks, 'Missing columns', 'All Guides needs Ionis# or Spacer Sequence.', severity='error')
+        return []
+    by_id, by_spacer = defaultdict(list), defaultdict(list)
+    whitelist_records = []
+    for index, row in whitelist.iterrows():
+        if not any(text(v) for v in row):
+            continue
+        rec = {field: _get(row, columns, field) for field in ALIASES}
+        rec.update({f'all_guides__{col}': text(row[col]) for col in whitelist.columns})
+        rec['Ionis#'] = identifier(rec['Ionis#'])
+        rec['spacer'] = spacer_text(rec['spacer'])
+        rec['all_guides_excel_rows'] = str(index + 2)
+        whitelist_records.append(rec)
+        if rec['Ionis#']:
+            by_id[rec['Ionis#']].append(rec)
+        if rec['spacer']:
+            by_spacer[rec['spacer']].append(rec)
+    used, records = set(), []
+    for sheet in SPACER_SHEETS:
+        if sheet not in frames:
+            _check(checks, 'Missing optional sheet', f'{sheet} is not present.')
+            continue
+        for rec in _raw_records(frames[sheet], sheet, checks, flat=False):
+            def in_scope(candidate):
+                scope = candidate['source_sheet'].casefold()
+                return not scope or scope == rec['source_sheet'].casefold()
+            candidates = [candidate for candidate in by_id.get(rec['Ionis#'], []) if in_scope(candidate)]
+            method = 'Ionis#'
+            if not candidates and rec['spacer']:
+                candidates = [candidate for candidate in by_spacer.get(rec['spacer'], []) if in_scope(candidate)]
+                method = 'Spacer Sequence fallback'
+            if not candidates:
+                continue  # Never admit spacer-data records outside the whitelist.
+            used.update(candidate['all_guides_excel_rows'] for candidate in candidates)
+            # A spacer fallback can match distinct IDs; keep their indel values separate.
+            candidate_groups = defaultdict(list)
+            for candidate in candidates:
+                candidate_groups[candidate['Ionis#'] or rec['Ionis#']].append(candidate)
+            for guide_id, associated in candidate_groups.items():
+                joined = dict(rec)
+                for field in ('gRNA Name', 'Description', *METRICS, 'Notes'):
+                    joined[field] = distinct(candidate[field] for candidate in associated)
+                joined['Ionis#'] = guide_id
+                joined['spacer'] = joined['spacer'] or distinct(candidate['spacer'] for candidate in associated)
+                joined['pam'] = joined['pam'] or distinct(candidate['pam'] for candidate in associated)
+                joined['all_guides_excel_rows'] = distinct(candidate['all_guides_excel_rows'] for candidate in associated)
+                joined['join_method'] = method
+                for key in associated[0]:
+                    if key.startswith('all_guides__'):
+                        joined[key] = distinct(candidate.get(key) for candidate in associated)
+                records.append(joined)
+    for rec in whitelist_records:
+        if rec['all_guides_excel_rows'] not in used:
+            _check(checks, 'Unmatched All Guides row', f"No spacer-data join for Ionis# {rec['Ionis#'] or '(blank)'}. Check ID, spacer, and source dataset.", 'All Guides', rec['all_guides_excel_rows'])
+    return records
+
+
+def _finalize(records, checks):
+    valid, excluded = [], []
+    for rec in records:
+        rec = dict(rec)
+        problems = []
+        rec['pam_site_raw'] = rec['pam_site']
+        site = integer_site(rec['pam_site'])
+        if site is None:
+            problems.append('pam_site must be a nonnegative integer, not a range or free text')
+        for field in ('Ionis#', 'nuclease', 'source_sheet'):
+            if not text(rec[field]):
+                problems.append(f'missing {field}')
+        strand = normalize_strand(rec['strand'])
+        if not strand:
+            problems.append('missing or unrecognized strand')
+        rec['strand_original'] = rec['strand']
+        rec['strand'] = strand
+        if problems:
+            rec['exclusion_reason'] = '; '.join(problems)
+            excluded.append(rec)
+            _check(checks, 'Excluded row', rec['exclusion_reason'], rec['source_sheet'], rec['source_row'])
+            continue
+        rec['pam_site'] = site
+        if not rec['spacer']:
+            _check(checks, 'Missing spacer (informational)', 'Spacer is optional; this record remains eligible.', rec['source_sheet'], rec['source_row'], 'info')
+        valid.append(rec)
+    # Include ID, dataset and coordinate context: never collapse distinct guide IDs.
+    buckets = defaultdict(list)
+    for rec in valid:
+        key = tuple(text(rec.get(field)).casefold() for field in
+                    ('source_sheet', 'reference_id', 'chromosome', 'Ionis#', 'spacer', 'nuclease', 'strand', 'pam_site', 'cut_site'))
+        buckets[key].append(rec)
+    merged = []
+    for key, rows in buckets.items():
+        result = dict(rows[0])
+        for col in set().union(*(row.keys() for row in rows)):
+            if col != 'pam_site':
+                result[col] = distinct(row.get(col) for row in rows)
+        result['pam_site'] = rows[0]['pam_site']
+        result['record_id'] = 'R-' + sha256(repr(key).encode()).hexdigest()[:20]
+        if len(rows) > 1:
+            _check(checks, 'Duplicate records merged', f'{len(rows)} records merged; all distinct values and row numbers retained.', result['source_sheet'], result['source_row'], 'info')
+        for metric in METRICS:
+            if numeric_indel(result.get(metric)) is None:
+                _check(checks, 'Missing numeric Indel%', metric, result['source_sheet'], result['source_row'])
+            elif len(set(numeric_values(result.get(metric)))) > 1:
+                _check(checks, 'Multiple Indel% values', f'{metric}: retained all values; ranking uses their maximum for this same record.', result['source_sheet'], result['source_row'], 'info')
+        merged.append(result)
+    guides = pd.DataFrame(merged)
+    if not guides.empty:
+        guides = guides.sort_values(['source_sheet', 'nuclease', 'strand', 'pam_site', 'record_id'], kind='stable').reset_index(drop=True)
+        for _, rows in guides.groupby(['source_sheet', 'Ionis#'], dropna=False):
+            if len(rows) > 1:
+                _check(checks, 'Repeated guide identifier', f"Ionis# {rows.iloc[0]['Ionis#']} occurs at multiple sites or annotations; distinct record IDs retained.", rows.iloc[0]['source_sheet'])
+    return guides, pd.DataFrame(excluded)
+
+
+def sheet_names(content):
+    with pd.ExcelFile(BytesIO(content), engine='openpyxl') as workbook:
+        return workbook.sheet_names
+
+
+def load_input(content, filename, sheet=None):
+    checks = []
+    mode, records = 'flat table', []
+    try:
+        if Path(filename).suffix.lower() == '.csv':
+            frame = pd.read_csv(BytesIO(content), dtype=object, keep_default_na=False)
+            records = _raw_records(frame, 'CSV', checks, flat=True)
+            sheets = ['CSV']
+        else:
+            with pd.ExcelFile(BytesIO(content), engine='openpyxl') as workbook:
+                sheets = workbook.sheet_names
+                if 'All Guides' in sheets and any(name in sheets for name in SPACER_SHEETS):
+                    mode = 'consolidated whitelist workbook'
+                    frames = {name: pd.read_excel(workbook, sheet_name=name, dtype=object, keep_default_na=False)
+                              for name in ('All Guides', *SPACER_SHEETS) if name in sheets}
+                    records = _consolidated(frames, checks)
+                else:
+                    selected = sheet or ('Guides' if 'Guides' in sheets else sheets[0])
+                    frame = pd.read_excel(workbook, sheet_name=selected, dtype=object, keep_default_na=False)
+                    records = _raw_records(frame, selected, checks, flat=True)
+        guides, excluded = _finalize(records, checks)
+    except (ValueError, OSError, KeyError, pd.errors.ParserError, EOFError, BadZipFile, UnicodeDecodeError) as error:
+        _check(checks, 'Input error', str(error), severity='error')
+        guides, excluded, sheets = pd.DataFrame(), pd.DataFrame(), []
+    return dict(guides=guides, excluded=excluded, checks=pd.DataFrame(checks, columns=['category', 'severity', 'source_sheet', 'source_row', 'detail']), mode=mode, sheets=sheets)
+
+# --- src/nearby_pam.py ---
+from collections import defaultdict
+from itertools import product
+import pandas as pd
+
+SCOPE = ('source_sheet', 'reference_id', 'chromosome', 'nuclease', 'strand')
+
+
+def find_nearby(guides):
+    """Compare spreadsheet pam_site integers directly; never map sequence."""
+    if guides.empty:
+        return pd.DataFrame(), pd.DataFrame(), {}, {}
+    indexed = guides.set_index('record_id', drop=False)
+    parent = {record: record for record in indexed.index}
+    def find(record):
+        while parent[record] != record:
+            parent[record] = parent[parent[record]]
+            record = parent[record]
+        return record
+    buckets = defaultdict(lambda: defaultdict(list))
+    for record, row in indexed.iterrows():
+        key = tuple(str(row.get(field, '')).strip().casefold() for field in SCOPE)
+        buckets[key][int(row['pam_site'])].append(record)
+    pairs = []
+    for key in sorted(buckets):
+        sites = buckets[key]
+        for site in sorted(sites):
+            for a, b in product(sorted(sites[site]), sorted(sites.get(site + 1, []))):
+                parent[find(b)] = find(a)
+                pair = dict(pair_id=f'P{len(pairs)+1:04}', record_id_a=a, record_id_b=b, pam_distance_nt=1)
+                for side, record in (('a', a), ('b', b)):
+                    for field, value in indexed.loc[record].items():
+                        pair[f'{field}_{side}'] = value
+                pairs.append(pair)
+    components = defaultdict(list)
+    involved = {pair[f'record_id_{side}'] for pair in pairs for side in ('a', 'b')}
+    for record in sorted(involved):
+        components[find(record)].append(record)
+    groups, record_to_group, record_to_pairs = [], {}, defaultdict(list)
+    for members in sorted(components.values(), key=lambda members: sorted(members)):
+        group_id = f'G{len(groups)+1:04}'
+        rows = indexed.loc[members]
+        groups.append(dict(group_id=group_id, record_ids='; '.join(members), group_size=len(members),
+                           pam_site_min=int(rows['pam_site'].min()), pam_site_max=int(rows['pam_site'].max()),
+                           **{field: rows.iloc[0].get(field, '') for field in SCOPE}))
+        record_to_group.update({record: group_id for record in members})
+    for pair in pairs:
+        pair['group_id'] = record_to_group[pair['record_id_a']]
+        for side in ('a', 'b'):
+            record_to_pairs[pair[f'record_id_{side}']].append(pair['pair_id'])
+    return pd.DataFrame(pairs), pd.DataFrame(groups), record_to_group, dict(record_to_pairs)
+
+# --- src/ranking.py ---
+import pandas as pd
+
+
+def rank_results(guides, pairs, groups, record_to_group, record_to_pairs, metric):
+    if metric not in METRICS:
+        raise ValueError('Unrecognized Indel% metric')
+    guides, pairs, groups = guides.copy(), pairs.copy(), groups.copy()
+    if guides.empty:
+        return guides, pairs, groups, pd.DataFrame()
+    guides['selected_indel_metric'] = metric
+    guides['selected_indel_value'] = [numeric_indel(value) for value in guides[metric]]
+    guides['group_id'] = guides['record_id'].map(record_to_group).fillna('')
+    guides['pair_id'] = guides['record_id'].map(lambda record: '; '.join(record_to_pairs.get(record, [])))
+    guides['pam_distance_nt'] = guides['record_id'].map(lambda record: 1 if record_to_pairs.get(record) else None)
+    guides['is_pair_or_group_winner'] = False
+    guides['winner_reason'] = ''
+    records = guides.set_index('record_id', drop=False)
+    best, reasons = [], {record: [] for record in records.index}
+    for entity_type, frame in (('pair', pairs), ('group', groups)):
+        for index, entity in frame.iterrows():
+            entity_id = entity[f'{entity_type}_id']
+            members = [entity['record_id_a'], entity['record_id_b']] if entity_type == 'pair' else entity['record_ids'].split('; ')
+            values = {record: numeric_indel(records.loc[record, metric]) for record in members}
+            usable = {record: value for record, value in values.items() if value is not None}
+            highest = max(usable.values()) if usable else None
+            winners = [record for record, value in usable.items() if value == highest]
+            reason = ('No numeric Indel% available' if not winners else
+                      'Tie for highest selected Indel%' if len(winners) > 1 else 'Highest selected Indel%')
+            frame.at[index, 'selected_indel_metric'] = metric
+            frame.at[index, 'winner_record_ids'] = '; '.join(winners)
+            frame.at[index, 'winner_reason'] = reason
+            frame.at[index, 'Winner'] = '; '.join(str(records.loc[record, 'gRNA Name'] or records.loc[record, 'Ionis#']) for record in winners) if winners else reason
+            frame.at[index, 'winning_indel_value'] = highest
+            if entity_type == 'pair':
+                for side in ('a', 'b'):
+                    frame.at[index, f'selected_indel_value_{side}'] = values[entity[f'record_id_{side}']]
+            for record in winners or [None]:
+                row = records.loc[record].to_dict() if record else {}
+                row.update(entity_type=entity_type, entity_id=entity_id, winner_record_id=record or '',
+                           selected_indel_metric=metric, selected_indel_value=highest, winner_reason=reason,
+                           is_pair_or_group_winner=bool(record))
+                best.append(row)
+                if record:
+                    reasons[record].append(f'{entity_id}: {reason}')
+            if not winners:
+                for record in members:
+                    reasons[record].append(f'{entity_id}: {reason}')
+    winning = {row['winner_record_id'] for row in best if row['winner_record_id']}
+    guides['is_pair_or_group_winner'] = guides['record_id'].isin(winning)
+    guides['winner_reason'] = guides['record_id'].map(lambda record: '; '.join(reasons[record]))
+    return guides, pairs, groups, pd.DataFrame(best)
+
+# --- src/templates.py ---
+"""Synthetic example data: not experimental results."""
+import pandas as pd
+
+REQUIRED_COLUMNS = ['Ionis#', 'pam_site', 'nuclease', 'strand', 'source_sheet', '135 Indel%']
+
+
+def example_table():
+    rows = [
+        ('DEMO001', 'Group A low', 100, 'SpCas9', '+', 'DEMO_A', 'chr1', 10, 5, 2, 0, '100 and 102 are NOT a pair; connected through 101.'),
+        ('DEMO002', 'Group A best', 101, 'SpCas9', '+', 'DEMO_A', 'chr1', 40, 20, 9, 1, 'Highest 135 Indel% in the three-guide connected group.'),
+        ('DEMO003', 'Group A mid', 102, 'SpCas9', '+', 'DEMO_A', 'chr1', 25, 12, 6, 0, 'Neighbor of 101 only.'),
+        ('DEMO004', 'Tie reverse A', 200, 'SpCas9', '-', 'DEMO_A', 'chr1', 55, 15, 7, 1, 'Tie at 135 Indel%.'),
+        ('DEMO005', 'Tie reverse B', 201, 'SpCas9', '-', 'DEMO_A', 'chr1', 55, 30, 8, 0, 'Tie at 135 Indel%; winner changes at 45 Indel%.'),
+        ('DEMO006', 'Missing A', 300, 'Cas12a', '+', 'DEMO_A', 'chr1', '', '', '', '', 'Pair has no numeric 135 Indel%.'),
+        ('DEMO007', 'Missing B', 301, 'Cas12a', '+', 'DEMO_A', 'chr1', 'not measured', '', '', '', 'Invalid metric is treated as missing.'),
+        ('DEMO008', 'Isolated', 400, 'SpCas9', '+', 'DEMO_A', 'chr1', 30, 10, 5, 0, '401 has a different nuclease, so no pair.'),
+        ('DEMO009', 'Different nuclease', 401, 'Cas12a', '+', 'DEMO_A', 'chr1', 90, 40, 10, 1, 'Different nuclease and source restrictions apply.'),
+        ('DEMO010', 'Different dataset', 402, 'Cas12a', '+', 'DEMO_B', 'chr1', 80, 30, 9, 1, 'Not paired with 401: different source dataset.'),
+        ('DEMO011', 'Different chromosome', 101, 'SpCas9', '+', 'DEMO_A', 'chr2', 99, 50, 20, 1, 'Never compared with chr1 coordinates.'),
+    ]
+    columns = ['Ionis#', 'gRNA Name', 'pam_site', 'nuclease', 'strand', 'source_sheet', 'chromosome', '135 Indel%', '45 Indel%', '11 Indel%', '0 Indel%', 'Notes']
+    frame = pd.DataFrame(rows, columns=columns)
+    frame['reference_id'] = 'DEMO_ASSEMBLY'
+    frame['spacer'] = ''
+    frame['pam'] = ''
+    return frame
+
+
+def schema_table():
+    return pd.DataFrame([
+        ('Ionis#', 'Required', 'Guide identifier. Ion_ID or guide_id are accepted aliases.'),
+        ('pam_site', 'Required', 'Nonnegative integer from your spreadsheet. Used directly, without sequence validation or coordinate conversion.'),
+        ('nuclease', 'Required', 'Enzyme label. Only identical labels (case-insensitive) are compared.'),
+        ('strand', 'Required', '+ or -. Forward/reverse and 1/-1 are accepted aliases.'),
+        ('source_sheet', 'Required in flat input', 'Dataset identifier; guides from different datasets are never paired.'),
+        ('135 Indel%', 'At least one metric column', 'Numeric values such as 40 represent 40 percentage points. Blank/text values are missing.'),
+        ('45 Indel%', 'Optional metric', 'Use the same numeric scale as the other metric columns.'),
+        ('11 Indel%', 'Optional metric', 'Use the same numeric scale as the other metric columns.'),
+        ('0 Indel%', 'Optional metric', 'Use the same numeric scale as the other metric columns.'),
+        ('gRNA Name', 'Optional', 'Human-readable guide name.'),
+        ('chromosome', 'Recommended if multiple chromosomes', 'Additional comparison boundary; different values are never paired.'),
+        ('reference_id', 'Recommended if multiple assemblies/loci', 'Additional comparison boundary; use one consistent coordinate system per value.'),
+        ('spacer', 'Optional', 'Metadata only, except as the original consolidated-workbook join fallback. No reference matching.'),
+        ('pam', 'Optional', 'Metadata only; not extracted or sequence-validated.'),
+        ('Notes', 'Optional', 'Free-text comments preserved in output.'),
+    ], columns=['Column', 'Requirement', 'Meaning'])
+
+# --- src/exports.py ---
+from io import BytesIO
+import pandas as pd
+from openpyxl.styles import Font, PatternFill, Alignment
+
+
+def safe_table(frame):
+    out = frame.copy()
+    def safe(value):
+        if isinstance(value, str) and len(value) > 1 and value.lstrip().startswith(('=', '+', '-', '@')):
+            return "'" + value
+        return value
+    for col in out:
+        out[col] = out[col].map(safe)
+    return out
+
+
+def csv_bytes(frame):
+    return safe_table(frame).to_csv(index=False).encode('utf-8-sig')
+
+
+def excel_bytes(tables):
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        for name, frame in tables.items():
+            safe_table(frame).to_excel(writer, sheet_name=name[:31], index=False)
+            ws = writer.sheets[name[:31]]
+            ws.freeze_panes = 'A2'
+            for cell in ws[1]:
+                cell.font = Font(name='Arial', bold=True, color='FFFFFF')
+                cell.fill = PatternFill('solid', fgColor='145A48')
+                cell.alignment = Alignment(wrap_text=True, vertical='center')
+            for row in ws.iter_rows(min_row=2):
+                for cell in row:
+                    cell.font = Font(name='Arial', size=10)
+                    cell.alignment = Alignment(vertical='top')
+            for col in ws.columns:
+                width = min(52, max(13, max(len(str(cell.value or '')) for cell in list(col)[:100]) + 2))
+                ws.column_dimensions[col[0].column_letter].width = width
+            ws.row_dimensions[1].height = 32
+    return buffer.getvalue()
+
+# --- Streamlit interface ---
+import hashlib
+import sys
+from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-# Resolve sibling modules independently of the deployment working directory.
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-st.set_page_config(page_title="Nearby PAM Guide Selector", page_icon="🧬", layout="wide")
-DEFAULT_NAME = "Sum_samples_guides_hJAG1_dKO_consolidated.xlsx"
-
-
-def default_path() -> Path | None:
-    candidates = [Path(__file__).parent / "fixtures" / DEFAULT_NAME, Path.cwd() / DEFAULT_NAME,
-                  Path("/home/user/output") / DEFAULT_NAME, Path("/mnt/data") / DEFAULT_NAME]
-    return next((p for p in candidates if p.exists()), None)
+st.set_page_config(page_title='Nearby PAM Guide Selector', page_icon='🧬', layout='wide')
 
 
 @st.cache_data(show_spinner=False)
-def cached_parse_workbook(content: bytes, filename: str):
-    return parse_workbook(content)
+def cached_load(content, filename, sheet):
+    return load_input(content, filename, sheet)
 
 
 @st.cache_data(show_spinner=False)
-def cached_match(reference: str, guides: pd.DataFrame):
-    return match_guides(reference, guides)
+def cached_sheets(content):
+    return sheet_names(content)
 
 
-def excel_bytes(tables: dict[str, pd.DataFrame]) -> bytes:
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        for name, table in tables.items():
-            table.to_excel(writer, sheet_name=name[:31], index=False)
-    return output.getvalue()
+@st.cache_data(show_spinner=False)
+def cached_analyze(guides, metric):
+    pairs, groups, record_to_group, record_to_pairs = find_nearby(guides)
+    return rank_results(guides, pairs, groups, record_to_group, record_to_pairs, metric)
 
 
-def warning_list(workbook_info, match_warnings, reference_error):
-    warnings = list(workbook_info.get("warnings", [])) + list(match_warnings)
-    if reference_error:
-        warnings.append(reference_error)
-    return sorted(set(warnings))
+def display_table(frame, best=False):
+    if frame.empty:
+        st.info('No rows to display.')
+        return
+    leading = ['entity_type', 'entity_id', 'group_id', 'pair_id', 'gRNA Name', 'Ionis#', 'pam_site',
+               'nuclease', 'strand', 'selected_indel_metric', 'selected_indel_value', 'source_sheet', 'source_row',
+               'Winner', 'winner_reason', 'pam_distance_nt']
+    ordered = [col for col in leading if col in frame] + [col for col in frame if col not in leading]
+    frame = frame[ordered]
+    if best and 'selected_indel_value' in frame:
+        try:
+            frame = frame.style.map(lambda value: 'background-color:#D8F3E6;color:#145A48;font-weight:bold' if pd.notna(value) else '', subset=['selected_indel_value'])
+        except (ImportError, AttributeError):
+            st.success('Winner results below retain all ties. Cell color formatting is unavailable in this environment.')
+    st.dataframe(frame, use_container_width=True, hide_index=True)
 
 
 def main():
-    st.title("Nearby PAM Guide Selector")
-    st.caption("Find whitelisted guides in a supplied reference sequence, compare exact 1-nt PAM-anchor neighbors, and rank each pair or connected group by the selected Indel% metric.")
+    st.title('Nearby PAM Guide Selector')
+    st.caption('Spreadsheet-only analysis: compare pam_site values exactly 1 nucleotide apart and rank nearby pairs and connected groups by Indel%. No reference sequence or spacer mapping is used.')
+    with st.expander('Input columns and example files'):
+        st.write('Required flat-table columns: Ionis#, pam_site, nuclease, strand, source_sheet, and at least one Indel% metric column. Spacer sequence is optional.')
+        st.warning('pam_site values must already use a consistent coordinate convention within each dataset/reference/chromosome. The app does not validate or convert genomic coordinates.')
+        st.download_button('Download example Excel', excel_bytes({'Guides': example_table(), 'Column Guide': schema_table()}), 'example_pam_site_guides.xlsx', key='template_excel')
+        st.download_button('Download example CSV', csv_bytes(example_table()), 'example_pam_site_guides.csv', 'text/csv', key='template_csv')
+        display_table(schema_table())
+
     with st.sidebar:
-        st.header("Inputs")
-        uploaded_workbook = st.file_uploader("Guide workbook (.xlsx)", type=["xlsx"], help=f"Expected default filename: {DEFAULT_NAME}")
-        fixture = default_path()
-        if uploaded_workbook is not None:
-            workbook_content, workbook_name = uploaded_workbook.getvalue(), uploaded_workbook.name
-        elif fixture:
-            workbook_content, workbook_name = fixture.read_bytes(), fixture.name
-            st.info(f"Using default fixture: {fixture}")
-        else:
-            workbook_content, workbook_name = None, ""
-            st.warning(f"Upload a workbook. The app will also auto-load {DEFAULT_NAME} if placed in the project fixtures folder.")
-        sequence_text = st.text_area("Raw gDNA sequence", height=140, placeholder="Paste A/C/G/T/N sequence or FASTA text")
-        sequence_file = st.file_uploader("Reference FASTA or plain-text file", type=["fa", "fasta", "txt"], help="If both inputs are supplied, this uploaded file takes precedence.")
-        metric = st.selectbox("Indel% metric", list(INDel_FIELDS), index=0)
-        workbook_info = cached_parse_workbook(workbook_content, workbook_name) if workbook_content else {"guides": pd.DataFrame(), "warnings": [], "available_nucleases": [], "available_strands": [], "available_sources": [], "checks": []}
-        nuclease_filter = st.multiselect("Nuclease/enzyme", workbook_info.get("available_nucleases", []))
-        strand_filter = st.multiselect("Source strand annotation", workbook_info.get("available_strands", []))
-        source_filter = st.multiselect("Source dataset/sheet", workbook_info.get("available_sources", []))
-        analyze = st.button("Analyze nearby PAM guides", type="primary", use_container_width=True)
-
-    if not analyze:
-        st.info("Provide a workbook and reference sequence, then select Analyze nearby PAM guides.")
-        if workbook_info.get("guides") is not None and not workbook_info["guides"].empty:
-            st.metric("Whitelisted guides loaded", len(workbook_info["guides"]))
-        return
-    if not workbook_content:
-        st.error("No workbook was provided.")
-        return
-    if sequence_file is not None:
-        raw_reference = sequence_file.getvalue().decode("utf-8", errors="replace")
-        st.info("The uploaded FASTA/plain-text file takes precedence over the text area.")
+        st.header('Spreadsheet input')
+        upload = st.file_uploader('Guide data (.xlsx or .csv)', type=['xlsx', 'csv'])
+        use_example = st.checkbox('Use synthetic example data', value=False)
+    if upload is not None:
+        content, filename = upload.getvalue(), upload.name
+        if use_example:
+            st.info('The uploaded file takes precedence over synthetic example data.')
+    elif use_example:
+        content, filename = csv_bytes(example_table()), 'example_pam_site_guides.csv'
     else:
-        raw_reference = sequence_text
-    reference, reference_error = normalize_reference(raw_reference)
-    if reference_error:
-        st.error(reference_error)
-        return
-
-    guides = workbook_info["guides"].copy()
-    if nuclease_filter:
-        guides = guides[guides["source_nuclease"].isin(nuclease_filter)]
-    if strand_filter:
-        guides = guides[guides["source_strand"].isin(strand_filter)]
-    if source_filter:
-        guides = guides[guides["source_sheet"].isin(source_filter)]
-    hits, match_warnings = cached_match(reference, guides)
-    pairs, groups, links = find_nearby(hits)
-    hits, best = rank_hits(hits, pairs, groups, links, metric)
-    warnings = warning_list(workbook_info, match_warnings, None)
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Reference length", f"{len(reference):,} nt")
-    c2.metric("Whitelisted guides loaded", len(guides))
-    c3.metric("Guide hits", len(hits))
-    c4.metric("Exact 1-nt pairs", len(pairs))
-    c5.metric("Connected groups", len(groups))
-    st.caption(f"Workbook: {workbook_name} · sheets used: {', '.join(workbook_info.get('sheet_names', []))} · PAM comparison uses exact abs(anchor A − anchor B) = 1 nt; 2-nt differences are excluded.")
-    if warnings:
-        with st.expander(f"Warnings ({len(warnings)})", expanded=False):
-            for warning in warnings:
-                st.warning(warning)
-
-    tab_best, tab_pairs, tab_seq, tab_all, tab_checks = st.tabs(["Best guides", "Nearby pairs", "Sequence view", "All matched guides", "Data checks"])
-    with tab_best:
-        st.subheader("Highest selected Indel% within each pair or connected group")
-        st.dataframe(best, use_container_width=True, hide_index=True)
-    with tab_pairs:
-        st.subheader("Qualifying nearby pairs")
-        st.dataframe(pair_table(hits, pairs, metric), use_container_width=True, hide_index=True)
-    with tab_seq:
-        st.subheader("Reference sequence view")
-        st.markdown('<span style="background:#13795b;color:white;padding:3px 8px;border-radius:4px;">Forward (+)</span> <span style="background:#7c3aed;color:white;padding:3px 8px;border-radius:4px;">Reverse (−)</span> &nbsp; highlighted regions include matched spacers and validated/attempted PAMs.', unsafe_allow_html=True)
-        if hits.empty:
-            st.info("No guide hits were found in the submitted reference.")
+        default = PROJECT_ROOT / 'fixtures' / 'Sum_samples_guides_hJAG1_dKO_consolidated.xlsx'
+        if default.exists():
+            content, filename = default.read_bytes(), default.name
         else:
-            window = st.slider("Coordinate window", 1, len(reference), (1, min(len(reference), 500)))
-            st.markdown(sequence_html(reference, hits, window[0], window[1]), unsafe_allow_html=True)
-            st.dataframe(hits[[c for c in ["hit_id", "gRNA Name", "Ionis#", "strand", "spacer_start", "spacer_end", "pam_start", "pam_end", "pam_anchor", "pam", "pam_valid"] if c in hits.columns]], use_container_width=True, hide_index=True)
-    with tab_all:
-        st.subheader("Every matched whitelisted guide hit")
-        st.dataframe(hits, use_container_width=True, hide_index=True)
-    with tab_checks:
-        st.subheader("Data checks and provenance")
-        check_rows = list(workbook_info.get("checks", []))
-        check_rows += [{"check": "PAM validation", "status": "warning" if any(hits.get("pam_valid", pd.Series(dtype=bool)) == False) else "pass", "detail": f"{int((~hits.get('pam_valid', pd.Series(dtype=bool))).sum()) if not hits.empty and 'pam_valid' in hits else 0} hit(s) lacked a validated PAM."}]
-        check_rows += [{"check": "Reference sequence", "status": "pass", "detail": f"Normalized and validated as {len(reference):,} nt."},
-                       {"check": "Nearby-PAM rule", "status": "pass", "detail": "Only same source sheet, nuclease, strand, and exact 1-nt PAM-anchor differences are included."}]
-        st.dataframe(pd.DataFrame(check_rows), use_container_width=True, hide_index=True)
-        if not workbook_info.get("unmatched_all_guides", pd.DataFrame()).empty:
-            st.write("Unmatched All Guides rows")
-            st.dataframe(workbook_info["unmatched_all_guides"], use_container_width=True, hide_index=True)
-        if not workbook_info.get("missing_spacers", pd.DataFrame()).empty:
-            st.write("Missing spacer sequences")
-            st.dataframe(workbook_info["missing_spacers"], use_container_width=True, hide_index=True)
+            st.info('Upload a workbook/CSV or enable synthetic example data in the sidebar.')
+            return
+    selected_sheet = None
+    if filename.lower().endswith('.xlsx'):
+        try:
+            names = cached_sheets(content)
+        except Exception as error:
+            st.error(f'Cannot open Excel file: {error}')
+            return
+        if not ('All Guides' in names and any(name in names for name in SPACER_SHEETS)):
+            selected_sheet = st.sidebar.selectbox('Worksheet', names, index=names.index('Guides') if 'Guides' in names else 0)
+    loaded = cached_load(content, filename, selected_sheet)
+    raw_guides = loaded['guides']
+    st.caption(f"File: {filename} · Input mode: {loaded['mode']} · Worksheets: {', '.join(loaded['sheets'])}")
+    if raw_guides.empty:
+        st.error('No eligible guide records were loaded. Review the data checks below.')
+        display_table(loaded['checks'])
+        display_table(loaded['excluded'])
+        return
+    with st.sidebar:
+        metric = st.selectbox('Indel% metric', METRICS)
+        filters = {}
+        for col, label in [('nuclease', 'Nuclease/enzyme'), ('strand', 'Strand'), ('source_sheet', 'Source dataset')]:
+            filters[col] = st.multiselect(label, sorted(raw_guides[col].unique()))
+        analyze = st.button('Analyze nearby PAM guides', type='primary', use_container_width=True)
+    guides = raw_guides.copy()
+    for col, selected in filters.items():
+        if selected:
+            guides = guides[guides[col].isin(selected)]
+    signature = hashlib.sha256(content + repr((filename, selected_sheet, metric, filters)).encode()).hexdigest()
+    if analyze:
+        st.session_state['pam_site_analysis'] = (signature, cached_analyze(guides, metric))
+    stored = st.session_state.get('pam_site_analysis')
+    if stored is None or stored[0] != signature:
+        st.info(f'{len(guides)} eligible guide records after filters. Select Analyze nearby PAM guides.')
+        with st.expander('Input data checks'):
+            display_table(loaded['checks'])
+        return
+    ranked, pairs, groups, best = stored[1]
+    metrics = st.columns(4)
+    for column, label, value in zip(metrics, ['Eligible guides', 'Guides in nearby groups', 'Exact 1-nt pairs', 'Connected groups'],
+                                    [len(ranked), ranked['group_id'].ne('').sum() if not ranked.empty else 0, len(pairs), len(groups)]):
+        column.metric(label, int(value))
+    st.info('Rule: abs(pam_site A − pam_site B) == 1. Same dataset, nuclease, strand, reference_id and chromosome required. Distances of 0 or 2 nt are excluded.')
+    st.caption('Indel values are used on their supplied numeric scale. Multiple values for the same deduplicated guide record are preserved; its ranking value is the highest numeric value. Ties are retained.')
+    if pairs.empty:
+        st.warning('No exact 1-nt nearby-PAM pairs were found after filtering.')
+    best_tab, pairs_tab, groups_tab, guides_tab, checks_tab = st.tabs(['Best guides', 'Nearby pairs', 'Connected groups', 'All guides', 'Data checks'])
+    with best_tab:
+        kind = st.radio('Show winners for', ['Groups and pairs', 'Groups only', 'Pairs only'], horizontal=True)
+        shown = best if kind == 'Groups and pairs' or best.empty else best[best['entity_type'].eq('group' if kind == 'Groups only' else 'pair')]
+        display_table(shown, best=True)
+    with pairs_tab:
+        display_table(pairs)
+    with groups_tab:
+        display_table(groups)
+    with guides_tab:
+        search = st.text_input('Filter by guide name, ID, spacer or note')
+        shown = ranked
+        if search and not ranked.empty:
+            mask = pd.Series(False, index=ranked.index)
+            for col in ['gRNA Name', 'Ionis#', 'spacer', 'Notes']:
+                mask |= ranked[col].astype(str).str.contains(search, case=False, regex=False, na=False)
+            shown = ranked[mask]
+        sort_by = st.selectbox('Sort guides by', ['pam_site', 'selected_indel_value'])
+        display_table(shown.sort_values(sort_by, ascending=sort_by == 'pam_site', na_position='last') if not shown.empty else shown)
+    with checks_tab:
+        st.warning('No reference matching, PAM extraction, strand inference or sequence-based validation is performed. All coordinates and strand annotations come from the input file.')
+        display_table(loaded['checks'])
+        if not loaded['excluded'].empty:
+            st.subheader('Excluded records')
+            display_table(loaded['excluded'])
+    st.subheader('Download analysis')
+    st.download_button('Download guide results CSV', csv_bytes(ranked), 'pam_site_guide_results.csv', 'text/csv')
+    st.download_button('Download nearby pairs CSV', csv_bytes(pairs), 'pam_site_pairs.csv', 'text/csv')
+    st.download_button('Download Excel results', excel_bytes({'Guides': ranked, 'Nearby Pairs': pairs, 'Connected Groups': groups, 'Best Guides': best, 'Data Checks': loaded['checks'], 'Excluded Records': loaded['excluded']}),
+                       'pam_site_results.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
-    export_tables = {"Matched Guides": hits, "Nearby Pairs": pair_table(hits, pairs, metric), "Best Guides": best, "Data Checks": pd.DataFrame(check_rows)}
-    st.download_button("Download matched-guide CSV", hits.to_csv(index=False).encode("utf-8"), file_name="nearby_pam_matched_guides.csv", mime="text/csv")
-    st.download_button("Download Excel results", excel_bytes(export_tables), file_name="nearby_pam_results.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
