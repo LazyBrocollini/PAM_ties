@@ -136,6 +136,10 @@ ALIASES = {
     'nuclease': ('nuclease', 'enzyme', 'nuclease/enzyme'),
     'strand': ('strand', 'orientation'),
     'source_sheet': ('source_sheet', 'source dataset', 'dataset'),
+    'region': ('region', 'target region', 'genomic region'),
+    'spacer_location': ('spacer_location', 'spacer location', 'spacer coordinates'),
+    'spacer_start': ('spacer_start', 'spacer start', 'spacer start position'),
+    'spacer_end': ('spacer_end', 'spacer end', 'spacer end position'),
     'reference_id': ('reference_id', 'assembly', 'reference'),
     'chromosome': ('chromosome', 'chrom', 'chr', 'contig'),
     'pam': ('pam', 'PAM sequence'),
@@ -240,6 +244,9 @@ def _consolidated(frames, checks, metrics):
                 joined = dict(rec)
                 for field in ('gRNA Name', 'Description', *metrics, 'Notes'):
                     joined[field] = distinct(candidate[field] for candidate in associated)
+                for field in ('gRNA Name', 'region', 'spacer_location', 'spacer_start', 'spacer_end'):
+                    if not joined.get(field):
+                        joined[field] = distinct(candidate[field] for candidate in associated) or rec.get(field, '')
                 joined['Ionis#'] = guide_id
                 joined['spacer'] = joined['spacer'] or distinct(candidate['spacer'] for candidate in associated)
                 joined['pam'] = joined['pam'] or distinct(candidate['pam'] for candidate in associated)
@@ -561,6 +568,43 @@ def excel_bytes(tables):
             ws.row_dimensions[1].height = 32
     return buffer.getvalue()
 
+# --- src/summaries.py ---
+"""Concise display/export projections; matching and ranking remain unchanged."""
+import pandas as pd
+
+PAIR_SUMMARY_FIELDS = ('gRNA Name', 'Ionis#', 'InDel%', 'pam_site',
+                       'source_sheet/region', 'Spacer Sequence', 'strand', 'Spacer Location')
+PAIR_SUMMARY_COLUMNS = [f'{field} {side.upper()}' for side in ('a', 'b')
+                        for field in PAIR_SUMMARY_FIELDS]
+
+
+def pair_summary(pairs):
+    """One row per exact 1-nt pair, with only the eight requested fields per guide.
+
+    Indel values are the selected active-file ranking values. Spacer locations
+    come only from supplied locations or explicit start/end columns, never PAMs.
+    """
+    rows = []
+    for _, pair in pairs.iterrows():
+        row = {}
+        for side in ('a', 'b'):
+            def value(field):
+                return pair.get(f'{field}_{side}', '')
+            source, region = text(value('source_sheet')), text(value('region'))
+            source_region = ' / '.join(dict.fromkeys(v for v in (source, region) if v))
+            location = text(value('spacer_location'))
+            if not location:
+                start, end = text(value('spacer_start')), text(value('spacer_end'))
+                if start and end:
+                    location = f'{start}–{end}'
+            values = [value('gRNA Name'), value('Ionis#'),
+                      pair.get(f'selected_indel_value_{side}', None), value('pam_site'),
+                      source_region, value('spacer'), value('strand'), location]
+            row.update({f'{field} {side.upper()}': item
+                        for field, item in zip(PAIR_SUMMARY_FIELDS, values)})
+        rows.append(row)
+    return pd.DataFrame(rows, columns=PAIR_SUMMARY_COLUMNS)
+
 # --- Streamlit interface ---
 import hashlib
 import sys
@@ -674,6 +718,7 @@ def main():
             display_table(loaded['checks'])
         return
     ranked, pairs, groups, best = stored[1]
+    pairs_summary = pair_summary(pairs)
     metrics = st.columns(4)
     for column, label, value in zip(metrics, ['Eligible guides', 'Guides in nearby groups', 'Exact 1-nt pairs', 'Connected groups'],
                                     [len(ranked), ranked['group_id'].ne('').sum() if not ranked.empty else 0, len(pairs), len(groups)]):
@@ -688,7 +733,8 @@ def main():
         shown = best if kind == 'Groups and pairs' or best.empty else best[best['entity_type'].eq('group' if kind == 'Groups only' else 'pair')]
         display_table(shown, best=True)
     with pairs_tab:
-        display_table(pairs)
+        st.caption(f'Guide A and Guide B are exactly 1 nt apart by pam_site. InDel% uses {metric} from the current upload. Spacer locations are shown only when supplied; no locations are inferred from PAM sites.')
+        st.dataframe(pairs_summary, use_container_width=True, hide_index=True)
     with groups_tab:
         display_table(groups)
     with guides_tab:
@@ -709,8 +755,8 @@ def main():
             display_table(loaded['excluded'])
     st.subheader('Download analysis')
     st.download_button('Download guide results CSV', csv_bytes(ranked), 'pam_site_guide_results.csv', 'text/csv')
-    st.download_button('Download nearby pairs CSV', csv_bytes(pairs), 'pam_site_pairs.csv', 'text/csv')
-    st.download_button('Download Excel results', excel_bytes({'Analysis Info': pd.DataFrame([{'source_file': filename, 'input_sha256': loaded['input_sha256'], 'metric_source_sheet': loaded['metric_source_sheet'], 'selected_indel_source_column': metric, 'comparison_rule': 'abs(pam_site_a - pam_site_b) == 1; no previous-file fallback'}]), 'Guides': ranked, 'Nearby Pairs': pairs, 'Connected Groups': groups, 'Best Guides': best, 'Data Checks': loaded['checks'], 'Excluded Records': loaded['excluded']}),
+    st.download_button('Download nearby pairs CSV', csv_bytes(pairs_summary), 'pam_site_pairs.csv', 'text/csv')
+    st.download_button('Download Excel results', excel_bytes({'Analysis Info': pd.DataFrame([{'source_file': filename, 'input_sha256': loaded['input_sha256'], 'metric_source_sheet': loaded['metric_source_sheet'], 'selected_indel_source_column': metric, 'comparison_rule': 'abs(pam_site_a - pam_site_b) == 1; no previous-file fallback'}]), 'Guides': ranked, 'Nearby Pairs': pairs_summary, 'Nearby Pairs Detail': pairs, 'Connected Groups': groups, 'Best Guides': best, 'Data Checks': loaded['checks'], 'Excluded Records': loaded['excluded']}),
                        'pam_site_results.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 
