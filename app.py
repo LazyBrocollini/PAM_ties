@@ -2,9 +2,15 @@ from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
+import sys
 
 import pandas as pd
 import streamlit as st
+
+# Resolve sibling modules independently of the deployment working directory.
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.guide_matching import match_guides
 from src.io_utils import INDel_FIELDS, parse_workbook
