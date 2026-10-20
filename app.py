@@ -10,7 +10,24 @@ import re
 from decimal import Decimal, InvalidOperation
 import pandas as pd
 
-METRICS = ('135 Indel%', '45 Indel%', '11 Indel%', '0 Indel%')
+def discover_indel_columns(columns):
+    """Keep only the active input's exact Indel metric headers, not provenance."""
+    reserved = {
+        'indelsourcefile', 'indelsourcesheet', 'indelsourcerows',
+        'selectedindelmetric', 'selectedindelsourcecolumn',
+        'selectedindelsourcerows', 'selectedindelvalue', 'winningindelvalue',
+    }
+    metrics = []
+    for col in columns:
+        label = str(col)
+        lower = label.lower()
+        key = re.sub(r'[^a-z0-9]', '', lower)
+        if ('indel' in key and key not in reserved
+                and not lower.startswith(('input__', 'all_guides__'))
+                and not any(word in lower for word in ('notes', 'description', 'comment'))):
+            metrics.append(label)
+    return metrics
+
 
 def text(value):
     if value is None:
@@ -80,6 +97,28 @@ def normalize_strand(value):
         return '-'
     return ''
 
+# --- src/state_utils.py ---
+"""Explicitly discard stale results when a file or selected worksheet changes."""
+from hashlib import sha256
+
+
+def input_token(content, filename, sheet):
+    digest = sha256()
+    digest.update(content)
+    digest.update(repr((filename, sheet)).encode())
+    return digest.hexdigest()
+
+
+def activate_input(state, token):
+    if state.get('pam_site_active_input') != token:
+        state.pop('pam_site_analysis', None)
+        state['pam_site_active_input'] = token
+
+
+def clear_input(state):
+    state.pop('pam_site_analysis', None)
+    state.pop('pam_site_active_input', None)
+
 # --- src/io_utils.py ---
 from collections import defaultdict
 from hashlib import sha256
@@ -103,7 +142,6 @@ ALIASES = {
     'cut_site': ('cut_site',),
     'Description': ('Description',),
     'Notes': ('Notes', 'Note'),
-    **{metric: (metric, metric.replace('%', '')) for metric in METRICS},
 }
 REQUIRED = ('Ionis#', 'pam_site', 'nuclease', 'strand', 'source_sheet')
 
@@ -127,13 +165,14 @@ def _check(checks, category, detail, source_sheet='', source_row='', severity='w
     checks.append(dict(category=category, severity=severity, source_sheet=source_sheet, source_row=source_row, detail=detail))
 
 
-def _raw_records(frame, sheet, checks, flat):
+def _raw_records(frame, sheet, checks, flat, metrics=None):
+    metrics = discover_indel_columns(frame.columns) if metrics is None else metrics
     cols = _columns(frame)
     required = REQUIRED if flat else ('pam_site', 'nuclease', 'strand')
     missing = [field for field in required if cols.get(field) is None]
     if not flat and cols['Ionis#'] is None and cols['spacer'] is None:
         missing.append('Ionis# or spacer')
-    if flat and not any(cols[metric] is not None for metric in METRICS):
+    if flat and not metrics:
         missing.append('at least one Indel% metric column')
     if missing:
         _check(checks, 'Missing columns', f'{sheet}: missing {", ".join(missing)}.', sheet, severity='error')
@@ -144,6 +183,7 @@ def _raw_records(frame, sheet, checks, flat):
             continue
         rec = {f'input__{col}': text(row[col]) for col in frame.columns}
         rec.update({field: _get(row, cols, field) for field in ALIASES})
+        rec.update({metric: text(row[metric]) for metric in metrics})
         rec['source_sheet'] = rec['source_sheet'] or (sheet if not flat else '')
         rec['input_sheet'] = sheet
         rec['source_row'] = str(index + 2)
@@ -153,7 +193,7 @@ def _raw_records(frame, sheet, checks, flat):
     return records
 
 
-def _consolidated(frames, checks):
+def _consolidated(frames, checks, metrics):
     whitelist = frames['All Guides']
     columns = _columns(whitelist)
     if columns['Ionis#'] is None and columns['spacer'] is None:
@@ -165,6 +205,7 @@ def _consolidated(frames, checks):
         if not any(text(v) for v in row):
             continue
         rec = {field: _get(row, columns, field) for field in ALIASES}
+        rec.update({metric: text(row[metric]) for metric in metrics})
         rec.update({f'all_guides__{col}': text(row[col]) for col in whitelist.columns})
         rec['Ionis#'] = identifier(rec['Ionis#'])
         rec['spacer'] = spacer_text(rec['spacer'])
@@ -179,7 +220,7 @@ def _consolidated(frames, checks):
         if sheet not in frames:
             _check(checks, 'Missing optional sheet', f'{sheet} is not present.')
             continue
-        for rec in _raw_records(frames[sheet], sheet, checks, flat=False):
+        for rec in _raw_records(frames[sheet], sheet, checks, flat=False, metrics=[]):
             def in_scope(candidate):
                 scope = candidate['source_sheet'].casefold()
                 return not scope or scope == rec['source_sheet'].casefold()
@@ -197,7 +238,7 @@ def _consolidated(frames, checks):
                 candidate_groups[candidate['Ionis#'] or rec['Ionis#']].append(candidate)
             for guide_id, associated in candidate_groups.items():
                 joined = dict(rec)
-                for field in ('gRNA Name', 'Description', *METRICS, 'Notes'):
+                for field in ('gRNA Name', 'Description', *metrics, 'Notes'):
                     joined[field] = distinct(candidate[field] for candidate in associated)
                 joined['Ionis#'] = guide_id
                 joined['spacer'] = joined['spacer'] or distinct(candidate['spacer'] for candidate in associated)
@@ -214,7 +255,7 @@ def _consolidated(frames, checks):
     return records
 
 
-def _finalize(records, checks):
+def _finalize(records, checks, metrics):
     valid, excluded = [], []
     for rec in records:
         rec = dict(rec)
@@ -256,7 +297,7 @@ def _finalize(records, checks):
         result['record_id'] = 'R-' + sha256(repr(key).encode()).hexdigest()[:20]
         if len(rows) > 1:
             _check(checks, 'Duplicate records merged', f'{len(rows)} records merged; all distinct values and row numbers retained.', result['source_sheet'], result['source_row'], 'info')
-        for metric in METRICS:
+        for metric in metrics:
             if numeric_indel(result.get(metric)) is None:
                 _check(checks, 'Missing numeric Indel%', metric, result['source_sheet'], result['source_row'])
             elif len(set(numeric_values(result.get(metric)))) > 1:
@@ -279,10 +320,14 @@ def sheet_names(content):
 def load_input(content, filename, sheet=None):
     checks = []
     mode, records = 'flat table', []
+    metrics, metric_source_sheet = [], ''
+    file_hash = sha256(content).hexdigest()
     try:
         if Path(filename).suffix.lower() == '.csv':
             frame = pd.read_csv(BytesIO(content), dtype=object, keep_default_na=False)
-            records = _raw_records(frame, 'CSV', checks, flat=True)
+            metrics = discover_indel_columns(frame.columns)
+            metric_source_sheet = 'CSV'
+            records = _raw_records(frame, 'CSV', checks, flat=True, metrics=metrics)
             sheets = ['CSV']
         else:
             with pd.ExcelFile(BytesIO(content), engine='openpyxl') as workbook:
@@ -291,16 +336,29 @@ def load_input(content, filename, sheet=None):
                     mode = 'consolidated whitelist workbook'
                     frames = {name: pd.read_excel(workbook, sheet_name=name, dtype=object, keep_default_na=False)
                               for name in ('All Guides', *SPACER_SHEETS) if name in sheets}
-                    records = _consolidated(frames, checks)
+                    metrics = discover_indel_columns(frames['All Guides'].columns)
+                    metric_source_sheet = 'All Guides'
+                    if not metrics:
+                        _check(checks, 'Missing columns', 'The uploaded All Guides sheet has no Indel columns. No other file or worksheet is used as a fallback.', 'All Guides', severity='error')
+                    else:
+                        records = _consolidated(frames, checks, metrics)
                 else:
                     selected = sheet or ('Guides' if 'Guides' in sheets else sheets[0])
                     frame = pd.read_excel(workbook, sheet_name=selected, dtype=object, keep_default_na=False)
-                    records = _raw_records(frame, selected, checks, flat=True)
-        guides, excluded = _finalize(records, checks)
+                    metrics = discover_indel_columns(frame.columns)
+                    metric_source_sheet = selected
+                    records = _raw_records(frame, selected, checks, flat=True, metrics=metrics)
+        for record in records:
+            record['indel_source_file'] = Path(filename).name
+            record['input_sha256'] = file_hash
+            record['indel_source_sheet'] = metric_source_sheet
+            record['indel_source_rows'] = record.get('all_guides_excel_rows', record['source_row'])
+        guides, excluded = _finalize(records, checks, metrics)
     except (ValueError, OSError, KeyError, pd.errors.ParserError, EOFError, BadZipFile, UnicodeDecodeError) as error:
         _check(checks, 'Input error', str(error), severity='error')
         guides, excluded, sheets = pd.DataFrame(), pd.DataFrame(), []
-    return dict(guides=guides, excluded=excluded, checks=pd.DataFrame(checks, columns=['category', 'severity', 'source_sheet', 'source_row', 'detail']), mode=mode, sheets=sheets)
+    guides.attrs['indel_metrics'] = list(metrics)
+    return dict(guides=guides, excluded=excluded, checks=pd.DataFrame(checks, columns=['category', 'severity', 'source_sheet', 'source_row', 'detail']), mode=mode, sheets=sheets, metrics=metrics, metric_source_sheet=metric_source_sheet, input_sha256=file_hash)
 
 # --- src/nearby_pam.py ---
 from collections import defaultdict
@@ -359,12 +417,14 @@ import pandas as pd
 
 
 def rank_results(guides, pairs, groups, record_to_group, record_to_pairs, metric):
-    if metric not in METRICS:
-        raise ValueError('Unrecognized Indel% metric')
     guides, pairs, groups = guides.copy(), pairs.copy(), groups.copy()
     if guides.empty:
         return guides, pairs, groups, pd.DataFrame()
+    if metric not in guides.attrs.get('indel_metrics', discover_indel_columns(guides.columns)):
+        raise ValueError('Selected Indel% column is not in the current input table. No previous-file fallback is allowed.')
     guides['selected_indel_metric'] = metric
+    guides['selected_indel_source_column'] = metric
+    guides['selected_indel_source_rows'] = guides.get('indel_source_rows', pd.Series('', index=guides.index))
     guides['selected_indel_value'] = [numeric_indel(value) for value in guides[metric]]
     guides['group_id'] = guides['record_id'].map(record_to_group).fillna('')
     guides['pair_id'] = guides['record_id'].map(lambda record: '; '.join(record_to_pairs.get(record, [])))
@@ -384,6 +444,10 @@ def rank_results(guides, pairs, groups, record_to_group, record_to_pairs, metric
             reason = ('No numeric Indel% available' if not winners else
                       'Tie for highest selected Indel%' if len(winners) > 1 else 'Highest selected Indel%')
             frame.at[index, 'selected_indel_metric'] = metric
+            frame.at[index, 'selected_indel_source_column'] = metric
+            for field in ('indel_source_file', 'indel_source_sheet', 'input_sha256'):
+                if field in records:
+                    frame.at[index, field] = records.loc[members[0], field]
             frame.at[index, 'winner_record_ids'] = '; '.join(winners)
             frame.at[index, 'winner_reason'] = reason
             frame.at[index, 'Winner'] = '; '.join(str(records.loc[record, 'gRNA Name'] or records.loc[record, 'Ionis#']) for record in winners) if winners else reason
@@ -443,7 +507,7 @@ def schema_table():
         ('nuclease', 'Required', 'Enzyme label. Only identical labels (case-insensitive) are compared.'),
         ('strand', 'Required', '+ or -. Forward/reverse and 1/-1 are accepted aliases.'),
         ('source_sheet', 'Required in flat input', 'Dataset identifier; guides from different datasets are never paired.'),
-        ('135 Indel%', 'At least one metric column', 'Numeric values such as 40 represent 40 percentage points. Blank/text values are missing.'),
+        ('Any header containing Indel (e.g. InDel%)', 'At least one metric column', 'Detected from the active file only. Examples include InDel%, Day 7 InDel%, and the original 135/45/11/0 headers. Values such as 40 represent 40 percentage points; blanks stay missing.'),
         ('45 Indel%', 'Optional metric', 'Use the same numeric scale as the other metric columns.'),
         ('11 Indel%', 'Optional metric', 'Use the same numeric scale as the other metric columns.'),
         ('0 Indel%', 'Optional metric', 'Use the same numeric scale as the other metric columns.'),
@@ -566,21 +630,21 @@ def main():
     elif use_example:
         content, filename = csv_bytes(example_table()), 'example_pam_site_guides.csv'
     else:
-        default = PROJECT_ROOT / 'fixtures' / 'Sum_samples_guides_hJAG1_dKO_consolidated.xlsx'
-        if default.exists():
-            content, filename = default.read_bytes(), default.name
-        else:
-            st.info('Upload a workbook/CSV or enable synthetic example data in the sidebar.')
-            return
+        clear_input(st.session_state)
+        st.info('Upload the file to analyze, or explicitly enable synthetic example data. No previous or default workbook is used.')
+        return
     selected_sheet = None
     if filename.lower().endswith('.xlsx'):
         try:
             names = cached_sheets(content)
         except Exception as error:
+            clear_input(st.session_state)
             st.error(f'Cannot open Excel file: {error}')
             return
         if not ('All Guides' in names and any(name in names for name in SPACER_SHEETS)):
             selected_sheet = st.sidebar.selectbox('Worksheet', names, index=names.index('Guides') if 'Guides' in names else 0)
+    token = input_token(content, filename, selected_sheet)
+    activate_input(st.session_state, token)
     loaded = cached_load(content, filename, selected_sheet)
     raw_guides = loaded['guides']
     st.caption(f"File: {filename} · Input mode: {loaded['mode']} · Worksheets: {', '.join(loaded['sheets'])}")
@@ -590,11 +654,12 @@ def main():
         display_table(loaded['excluded'])
         return
     with st.sidebar:
-        metric = st.selectbox('Indel% metric', METRICS)
+        metric = st.selectbox('Indel% metric from this file', loaded['metrics'], key=f'indel_metric_{token}')
         filters = {}
         for col, label in [('nuclease', 'Nuclease/enzyme'), ('strand', 'Strand'), ('source_sheet', 'Source dataset')]:
-            filters[col] = st.multiselect(label, sorted(raw_guides[col].unique()))
+            filters[col] = st.multiselect(label, sorted(raw_guides[col].unique()), key=f'{col}_{token}')
         analyze = st.button('Analyze nearby PAM guides', type='primary', use_container_width=True)
+    st.caption(f"Indel data source: {filename} / {loaded['metric_source_sheet']} / {metric}. Only this uploaded file's values are used.")
     guides = raw_guides.copy()
     for col, selected in filters.items():
         if selected:
@@ -645,7 +710,7 @@ def main():
     st.subheader('Download analysis')
     st.download_button('Download guide results CSV', csv_bytes(ranked), 'pam_site_guide_results.csv', 'text/csv')
     st.download_button('Download nearby pairs CSV', csv_bytes(pairs), 'pam_site_pairs.csv', 'text/csv')
-    st.download_button('Download Excel results', excel_bytes({'Guides': ranked, 'Nearby Pairs': pairs, 'Connected Groups': groups, 'Best Guides': best, 'Data Checks': loaded['checks'], 'Excluded Records': loaded['excluded']}),
+    st.download_button('Download Excel results', excel_bytes({'Analysis Info': pd.DataFrame([{'source_file': filename, 'input_sha256': loaded['input_sha256'], 'metric_source_sheet': loaded['metric_source_sheet'], 'selected_indel_source_column': metric, 'comparison_rule': 'abs(pam_site_a - pam_site_b) == 1; no previous-file fallback'}]), 'Guides': ranked, 'Nearby Pairs': pairs, 'Connected Groups': groups, 'Best Guides': best, 'Data Checks': loaded['checks'], 'Excluded Records': loaded['excluded']}),
                        'pam_site_results.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 
